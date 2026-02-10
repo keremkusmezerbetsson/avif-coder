@@ -95,7 +95,7 @@ task("androidSourcesJar", Jar::class) {
 
 android {
     namespace = "com.github.awxkee.avifcoder"
-    compileSdk = 34
+    compileSdk = 35
 
     defaultConfig {
         minSdk = 24

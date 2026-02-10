@@ -17,3 +17,4 @@ rootProject.name = "Avif"
 include ':app'
 include ':avif-coder'
 include ':avif-coder-coil'
+include ':avif-coder-coil-3'
