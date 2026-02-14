@@ -28,6 +28,7 @@
 
 #include "SizeScaler.h"
 #include <vector>
+#include <cmath>
 #include "imagebits/CopyUnalignedRGBA.h"
 #include "heif.h"
 #include <string>
@@ -35,6 +36,12 @@
 #include "JniException.h"
 #include "definitions.h"
 #include "avifweaver.h"
+#include <android/log.h>
+
+#define LOG_TAG "SizeScaler"
+#define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__)
+#define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
+#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
 bool RescaleImage(aligned_uint8_vector &initialData,
                   std::shared_ptr<heif_image_handle> &handle,
@@ -51,6 +58,9 @@ bool RescaleImage(aligned_uint8_vector &initialData,
     int xTranslation = 0, yTranslation = 0;
     int canvasWidth = scaledWidth;
     int canvasHeight = scaledHeight;
+
+    LOGD("RescaleImage: original=%dx%d, requestedCanvas=%dx%d, scaleMode=%d",
+         imageWidth, imageHeight, canvasWidth, canvasHeight, (int)scaleMode);
 
     if (scaleMode == Fit || scaleMode == Fill) {
       std::pair<uint32_t, uint32_t> currentSize(imageWidth, imageHeight);
@@ -134,12 +144,37 @@ bool RescaleImage(aligned_uint8_vector &initialData,
     if (xTranslation > 0 || yTranslation > 0) {
 
       int left = std::max(xTranslation, 0);
-      int right = xTranslation + canvasWidth;
+      int right = std::min(xTranslation + canvasWidth, scaledWidth);
       int top = std::max(yTranslation, 0);
-      int bottom = yTranslation + canvasHeight;
+      int bottom = std::min(yTranslation + canvasHeight, scaledHeight);
+
+      // Check if bounds would have exceeded without fix (would have crashed)
+      int unclamped_right = xTranslation + canvasWidth;
+      int unclamped_bottom = yTranslation + canvasHeight;
+      if (unclamped_right > scaledWidth || unclamped_bottom > scaledHeight) {
+        LOGE("RescaleImage WOULD HAVE CRASHED: original=%dx%d, unclamped_right=%d (max=%d), "
+             "unclamped_bottom=%d (max=%d), canvas=%dx%d",
+             *imageWidthPtr, *imageHeightPtr,
+             unclamped_right, scaledWidth, unclamped_bottom, scaledHeight,
+             canvasWidth, canvasHeight);
+      }
+
+      LOGD("RescaleImage Cropping: left=%d, right=%d, top=%d, bottom=%d, scaledSize=%dx%d",
+           left, right, top, bottom, scaledWidth, scaledHeight);
 
       int croppedWidth = right - left;
       int croppedHeight = bottom - top;
+
+      // Validate cropped dimensions - if invalid, return the scaled image without cropping
+      if (croppedWidth <= 0 || croppedHeight <= 0 || left >= scaledWidth || top >= scaledHeight) {
+        LOGE("RescaleImage INVALID CROP: croppedSize=%dx%d, left=%d, top=%d, scaledSize=%dx%d - returning uncropped",
+             croppedWidth, croppedHeight, left, top, scaledWidth, scaledHeight);
+        initialData = std::move(outData);
+        *imageWidthPtr = imageWidth;
+        *imageHeightPtr = imageHeight;
+        return true;
+      }
+
       int newStride =
           croppedWidth * 4 * (int) (useFloats ? sizeof(uint16_t) : sizeof(uint8_t));
       int srcStride = *stride;
@@ -231,8 +266,8 @@ aligned_uint8_vector RescaleSourceImage(uint8_t *sourceData,
                                         bool isImage64Bits,
                                         uint32_t *imageWidthPtr,
                                         uint32_t *imageHeightPtr,
-                                        uint32_t scaledWidth,
-                                        uint32_t scaledHeight,
+                                        int32_t scaledWidth,
+                                        int32_t scaledHeight,
                                         ScaleMode scaleMode,
                                         int scalingQuality,
                                         bool isRgba) {
@@ -241,29 +276,32 @@ aligned_uint8_vector RescaleSourceImage(uint8_t *sourceData,
   if ((scaledHeight != 0 || scaledWidth != 0) && (scaledWidth != 0 && scaledHeight != 0)) {
 
     int xTranslation = 0, yTranslation = 0;
-    uint32_t canvasWidth = scaledWidth;
-    uint32_t canvasHeight = scaledHeight;
+    uint32_t canvasWidth = scaledWidth > 0 ? static_cast<uint32_t>(scaledWidth) : 0;
+    uint32_t canvasHeight = scaledHeight > 0 ? static_cast<uint32_t>(scaledHeight) : 0;
+
+    LOGD("RescaleSourceImage: original=%ux%u, requestedCanvas=%ux%u, scaleMode=%d",
+         imageWidth, imageHeight, canvasWidth, canvasHeight, (int)scaleMode);
 
     if (scaleMode == Fit || scaleMode == Fill) {
       std::pair<uint32_t, uint32_t> currentSize(imageWidth, imageHeight);
       if (scaledHeight > 0 && scaledWidth < 0) {
-        auto newBounds = ResizeAspectHeight(currentSize, scaledHeight,
+        auto newBounds = ResizeAspectHeight(currentSize, static_cast<uint32_t>(scaledHeight),
                                             scaledWidth == -2);
-        scaledWidth = std::max(newBounds.first, static_cast<uint32_t>(1));
-        scaledHeight = std::max(newBounds.second, static_cast<uint32_t>(1));
+        scaledWidth = static_cast<int32_t>(std::max(newBounds.first, static_cast<uint32_t>(1)));
+        scaledHeight = static_cast<int32_t>(std::max(newBounds.second, static_cast<uint32_t>(1)));
       } else if (scaledHeight < 0) {
-        auto newBounds = ResizeAspectWidth(currentSize, scaledHeight,
+        auto newBounds = ResizeAspectWidth(currentSize, scaledWidth > 0 ? static_cast<uint32_t>(scaledWidth) : 1,
                                            scaledHeight == -2);
-        scaledWidth = std::max(newBounds.first, static_cast<uint32_t>(1));
-        scaledHeight = std::max(newBounds.second, static_cast<uint32_t>(1));
+        scaledWidth = static_cast<int32_t>(std::max(newBounds.first, static_cast<uint32_t>(1)));
+        scaledHeight = static_cast<int32_t>(std::max(newBounds.second, static_cast<uint32_t>(1)));
       } else {
         std::pair<uint32_t, uint32_t> dstSize;
         float scale = 1;
         if (scaleMode == Fill) {
-          std::pair<uint32_t, uint32_t> canvasSize(scaledWidth, scaledHeight);
+          std::pair<uint32_t, uint32_t> canvasSize(canvasWidth, canvasHeight);
           dstSize = ResizeAspectFill(currentSize, canvasSize, &scale);
         } else {
-          std::pair<uint32_t, uint32_t> canvasSize(scaledWidth, scaledHeight);
+          std::pair<uint32_t, uint32_t> canvasSize(canvasWidth, canvasHeight);
           dstSize = ResizeAspectFit(currentSize, canvasSize, &scale);
         }
 
@@ -272,10 +310,30 @@ aligned_uint8_vector RescaleSourceImage(uint8_t *sourceData,
         yTranslation = std::max((int) (((float) dstSize.second - (float) canvasHeight) /
             2.0f), 0);
 
-        scaledWidth = std::max(dstSize.first, static_cast<uint32_t>(1));
-        scaledHeight = std::max(dstSize.second, static_cast<uint32_t>(1));
+        scaledWidth = static_cast<int32_t>(std::max(dstSize.first, static_cast<uint32_t>(1)));
+        scaledHeight = static_cast<int32_t>(std::max(dstSize.second, static_cast<uint32_t>(1)));
       }
     }
+
+    // Ensure dimensions are positive before proceeding
+    if (scaledWidth <= 0 || scaledHeight <= 0) {
+      scaledWidth = std::max(scaledWidth, static_cast<int32_t>(1));
+      scaledHeight = std::max(scaledHeight, static_cast<int32_t>(1));
+    }
+
+    // Log if canvas exceeds scaled dimensions (would cause crash without bounds fix)
+    if (canvasWidth > static_cast<uint32_t>(scaledWidth) ||
+        canvasHeight > static_cast<uint32_t>(scaledHeight)) {
+      LOGE("BOUNDARY EXCEEDED: original=%ux%u, canvas=%ux%u, scaled=%dx%d, "
+           "xTrans=%d, yTrans=%d, scaleMode=%d",
+           *imageWidthPtr, *imageHeightPtr,
+           canvasWidth, canvasHeight,
+           scaledWidth, scaledHeight,
+           xTranslation, yTranslation, (int)scaleMode);
+    }
+
+    LOGD("Scaling: original=%ux%u -> scaled=%dx%d, xTrans=%d, yTrans=%d",
+         imageWidth, imageHeight, scaledWidth, scaledHeight, xTranslation, yTranslation);
 
     aligned_uint8_vector outData;
 
@@ -317,12 +375,36 @@ aligned_uint8_vector RescaleSourceImage(uint8_t *sourceData,
 
     if (xTranslation > 0 || yTranslation > 0) {
       int left = std::max(xTranslation, 0);
-      int right = xTranslation + static_cast<int>(canvasWidth);
+      int right = std::min(xTranslation + static_cast<int>(canvasWidth), scaledWidth);
       int top = std::max(yTranslation, 0);
-      int bottom = yTranslation + static_cast<int>(canvasHeight);
+      int bottom = std::min(yTranslation + static_cast<int>(canvasHeight), scaledHeight);
+
+      // Check if bounds would have exceeded without fix (would have crashed)
+      int unclamped_right = xTranslation + static_cast<int>(canvasWidth);
+      int unclamped_bottom = yTranslation + static_cast<int>(canvasHeight);
+      if (unclamped_right > scaledWidth || unclamped_bottom > scaledHeight) {
+        LOGE("WOULD HAVE CRASHED: original=%ux%u, unclamped_right=%d (max=%d), "
+             "unclamped_bottom=%d (max=%d), canvas=%ux%u",
+             *imageWidthPtr, *imageHeightPtr,
+             unclamped_right, scaledWidth, unclamped_bottom, scaledHeight,
+             canvasWidth, canvasHeight);
+      }
+
+      LOGD("Cropping: left=%d, right=%d, top=%d, bottom=%d, scaledSize=%dx%d",
+           left, right, top, bottom, scaledWidth, scaledHeight);
 
       int croppedWidth = right - left;
       int croppedHeight = bottom - top;
+
+      // Validate cropped dimensions - if invalid, return the scaled image without cropping
+      if (croppedWidth <= 0 || croppedHeight <= 0 || left >= scaledWidth || top >= scaledHeight) {
+        LOGE("INVALID CROP: croppedSize=%dx%d, left=%d, top=%d, scaledSize=%dx%d - returning uncropped",
+             croppedWidth, croppedHeight, left, top, scaledWidth, scaledHeight);
+        *imageWidthPtr = imageWidth;
+        *imageHeightPtr = imageHeight;
+        return outData;
+      }
+
       uint32_t newStride =
           croppedWidth * 4 * (int) (isImage64Bits ? sizeof(uint16_t) : sizeof(uint8_t));
       uint32_t srcStride = *stride;
@@ -395,8 +477,10 @@ ResizeAspectFit(std::pair<uint32_t, uint32_t> sourceSize,
   float yFactor = (float) dstSize.second / (float) sourceSize.second;
   float resizeFactor = std::min(xFactor, yFactor);
   *scale = resizeFactor;
-  std::pair<uint32_t, uint32_t> resultSize((uint32_t)((float) sourceWidth * resizeFactor),
-                                           (uint32_t)((float) sourceHeight * resizeFactor));
+  // Use std::round to prevent off-by-one errors from float truncation
+  std::pair<uint32_t, uint32_t> resultSize(
+      (uint32_t) std::round((float) sourceWidth * resizeFactor),
+      (uint32_t) std::round((float) sourceHeight * resizeFactor));
   return resultSize;
 }
 
@@ -410,8 +494,10 @@ ResizeAspectFill(std::pair<uint32_t, uint32_t> sourceSize,
   float yFactor = (float) dstSize.second / (float) sourceSize.second;
   float resizeFactor = std::max(xFactor, yFactor);
   *scale = resizeFactor;
-  std::pair<uint32_t, uint32_t> resultSize((uint32_t)((float) sourceWidth * resizeFactor),
-                                           (uint32_t)((float) sourceHeight * resizeFactor));
+  // Use std::round to prevent off-by-one errors from float truncation
+  std::pair<uint32_t, uint32_t> resultSize(
+      (uint32_t) std::round((float) sourceWidth * resizeFactor),
+      (uint32_t) std::round((float) sourceHeight * resizeFactor));
   return resultSize;
 }
 
@@ -420,8 +506,10 @@ ResizeAspectHeight(std::pair<uint32_t, uint32_t> sourceSize, uint32_t maxHeight,
   uint32_t sourceWidth = sourceSize.first;
   uint32_t sourceHeight = sourceSize.second;
   float scaleFactor = (float) maxHeight / (float) sourceSize.second;
-  std::pair<uint32_t, uint32_t> resultSize((uint32_t)((float) sourceWidth * scaleFactor),
-                                           (uint32_t)((float) sourceHeight * scaleFactor));
+  // Use std::round to prevent off-by-one errors from float truncation
+  std::pair<uint32_t, uint32_t> resultSize(
+      (uint32_t) std::round((float) sourceWidth * scaleFactor),
+      (uint32_t) std::round((float) sourceHeight * scaleFactor));
   if (multipleBy2) {
     resultSize.first = (resultSize.first / 2) * 2;
     resultSize.second = (resultSize.second / 2) * 2;
@@ -434,8 +522,10 @@ ResizeAspectWidth(std::pair<uint32_t, uint32_t> sourceSize, uint32_t maxWidth, b
   uint32_t sourceWidth = sourceSize.first;
   uint32_t sourceHeight = sourceSize.second;
   float scaleFactor = (float) maxWidth / (float) sourceSize.first;
-  std::pair<uint32_t, uint32_t> resultSize((uint32_t)((float) sourceWidth * scaleFactor),
-                                           (uint32_t)((float) sourceHeight * scaleFactor));
+  // Use std::round to prevent off-by-one errors from float truncation
+  std::pair<uint32_t, uint32_t> resultSize(
+      (uint32_t) std::round((float) sourceWidth * scaleFactor),
+      (uint32_t) std::round((float) sourceHeight * scaleFactor));
   if (multipleBy2) {
     resultSize.first = (resultSize.first / 2) * 2;
     resultSize.second = (resultSize.second / 2) * 2;
